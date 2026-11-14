@@ -1,16 +1,29 @@
-﻿using System.Collections.Concurrent;
+﻿using System;
+using System.Collections;
 using System.Runtime.CompilerServices;
-using System.Security.Cryptography;
 
 namespace ObjectLibrary {
 
-    public sealed class Entry<TType> {
+    public sealed class Entry<TType>(TType value) {
 
-        public TType Value { get; } // Immutable
+        public TType Value { get; } = value;
 
-        public Entry(TType value) {
 
-            Value = value;
+    }
+
+    internal readonly record struct Slot(
+        EnumKey Key, 
+        object Value, 
+        DateTimeOffset Recent) : IDisposable {
+
+        public bool IsExpired(
+            TimeProvider provider, 
+            TimeSpan timeToExpire) 
+            => provider.GetUtcNow() >= Recent + timeToExpire;
+
+        public void Dispose() {
+
+
         }
     }
 
@@ -38,49 +51,99 @@ namespace ObjectLibrary {
     public enum Result {
 
         Success,
-        WrongKey,
         AlreadyExist,
-        Failed,
+        WrongKey,
         Full
     }
 
-    public class Library {
+    public class Library(
+        int? initialCapacity = null, 
+        TimeSpan? timeToExpire = null) 
+        : IEnumerable<Slot> {
 
-        public Library(int? capacity = null) => _capacity = capacity ?? -1;
+        private readonly object syncRoot = new();
 
-        private sealed record State(int Capacity, int Count);
-        private readonly ConcurrentDictionary<EnumKey, object> database = [];
+        private readonly LinkedList<Slot> priorities = new();
+        private readonly Dictionary<EnumKey, LinkedListNode<Slot>> values = new();
 
-        public int Capacity {
+        private readonly TimeSpan _timeToExpire = timeToExpire ?? TimeSpan.MaxValue;
+        private readonly TimeProvider _time = TimeProvider.System;
 
-            get => Volatile.Read(ref _capacity);
-            set => Volatile.Write(ref _capacity, value);
+        private int capacity = initialCapacity ?? int.MaxValue;
+        public int Capacity { 
+
+            get {
+
+                lock (syncRoot)
+                    return capacity;
+            }
+            set {
+
+                ArgumentOutOfRangeException.ThrowIfNegative(value);
+
+                lock (syncRoot) {
+
+                    while (values.Count > value) {
+
+                        LinkedListNode<Slot> oldNode = priorities.First!;
+
+                        values.Remove(oldNode.Value.Key);
+                        priorities.Remove(oldNode);
+                    }
+
+                    capacity = value;
+                }
+            }
         }
+        
+        public int Count { 
 
-        public int Count => Volatile.Read(ref _count);
+            get {
 
-        private int _capacity = -1;   // -1 = unbounded
-        private int _count;
-
-        public event Action? OnEviction;
-
-        // Atomically claim a slot, or fail if full
-        private bool TryReserve() {
-
-            while (true) {
-
-                int count = Volatile.Read(ref _count);
-                int cap = Volatile.Read(ref _capacity);
-
-                if (cap >= 0 && count >= cap)
-                    return false;
-
-                if (Interlocked.CompareExchange(ref _count, count + 1, count) == count)
-                    return true;
+                lock (syncRoot)
+                    return values.Count;
             }
         }
 
-        private void Release() => Interlocked.Decrement(ref _count);
+        IEnumerator IEnumerable.GetEnumerator() => GetEnumerator();
+        public IEnumerator<Slot> GetEnumerator() {
+
+            Slot[] snapshot;
+
+            lock (syncRoot) {
+
+                snapshot = new Slot[priorities.Count];
+                priorities.CopyTo(snapshot, 0);
+            }
+
+            return ((IEnumerable<Slot>)snapshot).GetEnumerator();
+        }
+        public int EnsureCapacity(int capacity) {
+
+            ArgumentOutOfRangeException.ThrowIfNegative(capacity);
+
+            lock (syncRoot) {
+
+                if (this.capacity < capacity)
+                    this.capacity = capacity;
+
+                return this.capacity;
+            }
+        }
+
+        public void TrimExcess() {
+
+            lock (syncRoot) {
+
+                capacity = values.Count;
+            }
+        }
+
+        private void MoveToEnd(LinkedListNode<Slot> node) {
+
+            priorities.Remove(node);
+            priorities.AddLast(node);
+        }
 
         public bool TryStore<TKey, TType>(
             TKey k,
@@ -91,31 +154,42 @@ namespace ObjectLibrary {
         public Result TryStoreResult<TKey, TType>(
             TKey k,
             Entry<TType> entry,
-            bool overwrite = false) where TKey : struct, Enum {
+            bool overwrite = true) where TKey : struct, Enum {
 
             ArgumentNullException.ThrowIfNull(entry);
             var key = EnumKey.Create(k);
 
-            while (true) {
+            lock (syncRoot) {
 
-                if (overwrite && database.TryGetValue(key, out var existing)) {
+                // Existing key
+                if (values.TryGetValue(key, out var node)) {
 
-                    if (database.TryUpdate(key, entry, existing)) // Overwrite count doesn't need changed
-                        return Result.Success;
+                    if (!overwrite)
+                        return Result.AlreadyExist;
 
-                    continue;
+                    node.Value = new Slot(key, entry);
+                    MoveToEnd(node);
+                    return Result.Success;
                 }
 
-                if (!TryReserve()) // If false is full, otherwise count is updated
-                    return Result.Full;
+                // Full (also covers capacity 0, where there is nothing to evict)
+                if (values.Count >= capacity) {
 
-                if (database.TryAdd(key, entry)) // If false key already exists
+                    if (!overwrite || priorities.First is null)
+                        return Result.Full;
+
+                    var oldNode = priorities.First;
+
+                    values.Remove(oldNode.Value.Key);
+                    oldNode.Value = new Slot(key, entry);
+                    values.Add(key, oldNode);
+                    MoveToEnd(oldNode);
                     return Result.Success;
+                }
 
-                Release(); // Decrement count as it was already updated elsewhere
-
-                if (!overwrite) // If no overwrite return, otherwise loop back (might be redundant)
-                    return Result.AlreadyExist;
+                // Room available
+                values.Add(key, priorities.AddLast(new Slot(key, entry)));
+                return Result.Success;
             }
         }
 
@@ -128,75 +202,64 @@ namespace ObjectLibrary {
             TKey k,
             out Entry<TType> entry) where TKey : struct, Enum {
 
-            var key = EnumKey.Create(k);
             entry = null!;
 
-            if (!database.TryGetValue(key, out var o))
-                return Result.WrongKey;
+            lock (syncRoot) {
 
-            if (o is not Entry<TType> found)
-                throw new ArgumentException($"Entry under this key is {o.GetType()}, not {typeof(Entry<TType>)}.");
+                if (!values.TryGetValue(EnumKey.Create(k), out LinkedListNode<Slot>? node))
+                    return Result.WrongKey;
 
-            if (!database.TryRemove(new KeyValuePair<EnumKey, object>(key, o)))
-                return Result.Failed;
+                if (node.Value.Value is not Entry<TType> found)
+                    throw new ArgumentException($"Entry under this key is {node.Value.Value.GetType()}, not {typeof(Entry<TType>)}.");
 
-            Release();
-            entry = found;
-            return Result.Success;
+                values.Remove(node.Value.Key);
+                priorities.Remove(node);
+
+                entry = found;
+                return Result.Success;
+            }
         }
 
         public object? TryPeek<TKey>( 
             TKey k) where TKey : struct, Enum {
 
-            var key = EnumKey.Create(k);
+            lock (syncRoot) {
 
-            if (database.TryGetValue(key, out var entry))
-                return entry;
+                if (!values.TryGetValue(EnumKey.Create(k), out LinkedListNode<Slot>? node))
+                    return default;
 
-            return null;
+                return node.Value.Value;
+            }
         }
 
-        public bool Contains<TKey>(
+        public bool ContainsKey<TKey>(
             TKey k) where TKey : struct, Enum {
 
-            return database.ContainsKey(EnumKey.Create(k));
+            lock (syncRoot)
+                return values.ContainsKey(EnumKey.Create(k));
         }
 
         public bool Discard<TKey>(
             TKey k) where TKey : struct, Enum {
 
-            if (database.TryRemove(EnumKey.Create(k), out _)) {
+            lock (syncRoot) {
 
-                Release();
+                if (!values.TryGetValue(EnumKey.Create(k), out LinkedListNode<Slot>? node))
+                    return false;
+
+                values.Remove(node.Value.Key);
+                priorities.Remove(node);
                 return true;
             }
-
-            return false;
-        }
-
-        public bool Replace<TKey, TValue>(
-            TKey k,
-            Entry<TValue> entry) where TKey : struct, Enum
-            => ReplaceResult(k, entry) == Result.Success;
-
-        public Result ReplaceResult<TKey, TValue>( 
-            TKey k,
-            Entry<TValue> entry) where TKey : struct, Enum {
-
-            ArgumentNullException.ThrowIfNull(entry);
-            var key = EnumKey.Create(k);
-
-            if (!database.TryGetValue(key, out var old))
-                return Result.WrongKey;
-
-            return database.TryUpdate(key, entry, old) ? Result.Success : Result.Failed;
         }
 
         public void Clear() {
 
-            foreach (var kv in database)
-                if (database.TryRemove(kv))
-                    Release();
+            lock (syncRoot) {
+
+                priorities.Clear();
+                values.Clear();
+            }
         }
     }
 }
