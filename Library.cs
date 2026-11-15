@@ -1,14 +1,14 @@
-﻿using System.Collections;
-using System.Runtime.CompilerServices;
+﻿using System.Runtime.CompilerServices;
 
 namespace ObjectLibrary {
 
+    public readonly record struct KeyedEntry(EnumKey Key, object Value);
     public sealed class Entry<TType>(TType value) {
 
         public TType Value { get; } = value;
     }
 
-    public readonly record struct Slot(
+    internal readonly record struct Slot(
         EnumKey Key, 
         object Value, 
         DateTimeOffset Recent) {
@@ -44,16 +44,19 @@ namespace ObjectLibrary {
 
         Success,
         AlreadyExist,
-        WrongKey,
+        KeyNotFound,
         Full
     }
 
     public class Library(
         int? initialCapacity = null, 
-        TimeSpan? timeToExpire = null) 
-        : IEnumerable<Slot> {
+        TimeSpan? timeToExpire = null,
+        bool? overwriteOldEntries = null) {
 
         private readonly object syncRoot = new();
+
+        public event Action<KeyedEntry>? OnExpire;
+        public event Action<KeyedEntry>? OnEvict;
 
         private readonly LinkedList<Slot> priorities = new();
         private readonly Dictionary<EnumKey, LinkedListNode<Slot>> values = new();
@@ -61,27 +64,17 @@ namespace ObjectLibrary {
         private readonly TimeSpan _timeToExpire = timeToExpire ?? TimeSpan.MaxValue;
         private readonly TimeProvider _time = TimeProvider.System;
 
+        private volatile bool overwriteOld = overwriteOldEntries ?? false;
+        public bool OverwriteOld {
+
+            get => overwriteOld;
+            set => overwriteOld = value;
+        }
+
         private int capacity = initialCapacity ?? int.MaxValue;
-        public int Capacity { 
+        public int Capacity {
 
-            get {
-
-                List<Slot>? expired = null;
-
-                try {
-
-                    lock (syncRoot) {
-
-                        expired = SweepExpired();
-
-                        return capacity;
-                    }
-                }
-                finally {
-
-                    Raise(expired);
-                }
-            }
+            get => capacity;
             set {
 
                 List<Slot>? expired = null;
@@ -107,7 +100,7 @@ namespace ObjectLibrary {
                 }
                 finally {
 
-                    Raise(expired);
+                    RaiseExpire(expired);
                 }
             }
         }
@@ -129,77 +122,8 @@ namespace ObjectLibrary {
                 }
                 finally {
 
-                    Raise(expired);
+                    RaiseExpire(expired);
                 }
-            }
-        }
-
-        public event Action<object>? OnExpire;
-
-        IEnumerator IEnumerable.GetEnumerator() => GetEnumerator();
-        public IEnumerator<Slot> GetEnumerator() {
-
-            Slot[] snapshot;
-            List<Slot>? expired = null;
-
-            try {
-
-                lock (syncRoot) {
-
-                    expired = SweepExpired();
-
-                    snapshot = new Slot[priorities.Count];
-                    priorities.CopyTo(snapshot, 0);
-                }
-
-                return ((IEnumerable<Slot>)snapshot).GetEnumerator();
-            }
-            finally {
-
-                Raise(expired);
-            }
-        }
-
-        public int EnsureCapacity(int capacity) {
-
-            List<Slot>? expired = null;
-
-            try {
-
-                ArgumentOutOfRangeException.ThrowIfNegative(capacity);
-
-                lock (syncRoot) {
-
-                    expired = SweepExpired();
-
-                    if (this.capacity < capacity)
-                        this.capacity = capacity;
-
-                    return this.capacity;
-                }
-            }
-            finally {
-
-                Raise(expired);
-            }
-        }
-
-        public void TrimExcess() {
-
-            List<Slot>? expired = null;
-
-            try {
-
-                lock (syncRoot) {
-
-                    expired = SweepExpired();
-
-                    capacity = values.Count;
-                }
-            }
-            finally {
-
-                Raise(expired);
             }
         }
 
@@ -223,26 +147,26 @@ namespace ObjectLibrary {
             return expired;
         }
 
-        private void Raise(List<Slot>? expired) {
+        private void RaiseExpire(List<Slot>? expired) {
 
             if (expired is null or { Count: 0 })
                 return;
 
-            var handler = OnExpire;
-            if (handler is null)
+            // copy so an unsubscribe can't null it mid-loop
+            if (OnExpire is not { } handler)
                 return;
-
+            
             foreach (Slot slot in expired) {
 
-                try {
-
-                    handler(slot.Value);
-                }
-                catch {
-
-                    // one bad subscriber shouldn't stop the rest or replace an in-flight exception
-                }
+                try { handler(new KeyedEntry(slot.Key, slot.Value)); }
+                catch { }
             }
+        }
+
+        private void RaiseEvict(Slot evicted) {
+
+            try { OnEvict?.Invoke(new KeyedEntry(evicted.Key, evicted.Value)); }
+            catch { }
         }
 
         private void MoveToEnd(LinkedListNode<Slot> node) {
@@ -251,18 +175,41 @@ namespace ObjectLibrary {
             priorities.AddLast(node);
         }
 
-        public bool TryStore<TKey, TType>(
+        // Snapshot gets entries from newest to oldest.
+        // Snapshot is made under lock, after return values can be changed before user can act on them.
+        public List<KeyedEntry> GetSnapshot() {
+
+            List<KeyedEntry> entries = new();
+
+            lock (syncRoot) {
+
+                if (priorities.First is null)
+                    return entries;
+
+                foreach (Slot slot in priorities) {
+
+                    entries.Add(new KeyedEntry(slot.Key, slot.Value));
+                }
+            }
+
+            return entries;
+        }
+
+        // Add with optional option to replace
+        public bool TryAdd<TKey, TType>(
             TKey k,
             Entry<TType> entry,
             bool overwrite = false) where TKey : struct, Enum
-            => TryStoreResult(k, entry, overwrite) == Result.Success;
+            => TryAddResult(k, entry, overwrite) == Result.Success;
 
-        public Result TryStoreResult<TKey, TType>(
+        public Result TryAddResult<TKey, TType>(
             TKey k,
             Entry<TType> entry,
             bool overwrite = false) where TKey : struct, Enum {
 
             List<Slot>? expired = null;
+            Slot? evicted = null;
+            Result result;
 
             try {
 
@@ -273,43 +220,64 @@ namespace ObjectLibrary {
 
                     expired = SweepExpired();
 
-                    // Existing key
-                    if (values.TryGetValue(key, out var node)) {
+                    var now = _time.GetUtcNow();
+                    bool exists = values.TryGetValue(key, out var node);
+                    bool full = values.Count >= capacity;
 
-                        if (!overwrite)
-                            return Result.AlreadyExist;
+                    // Key taken, caller didn't ask to replace it
+                    if (exists && !overwrite) {
 
-                        node.Value = new Slot(key, entry, _time.GetUtcNow());
-                        MoveToEnd(node);
-                        return Result.Success;
+                        result = Result.AlreadyExist;
                     }
+                    // Key taken, replace it in place (count doesn't change, so no capacity check)
+                    else if (exists) {
 
-                    // Full (also covers capacity 0, where there is nothing to evict)
-                    if (values.Count >= capacity) {
+                        // Re-adding the same Entry isn't a displacement
+                        if (!ReferenceEquals(node!.Value.Value, entry))
+                            evicted = node.Value;
 
-                        if (!overwrite || priorities.First is null)
-                            return Result.Full;
+                        node.Value = new Slot(key, entry, now);
+                        MoveToEnd(node);
 
-                        var oldNode = priorities.First;
+                        result = Result.Success;
+                    }
+                    // Full and not allowed to evict (also covers capacity 0)
+                    else if (full && (!overwriteOld || priorities.First is null)) {
+
+                        result = Result.Full;
+                    }
+                    // Full, evict the oldest and reuse its node
+                    else if (full) {
+
+                        var oldNode = priorities.First!;
+                        evicted = oldNode.Value;
 
                         values.Remove(oldNode.Value.Key);
-                        oldNode.Value = new Slot(key, entry, _time.GetUtcNow());
+                        oldNode.Value = new Slot(key, entry, now);
                         values.Add(key, oldNode);
                         MoveToEnd(oldNode);
-                        return Result.Success;
+                        result = Result.Success;
                     }
-
                     // Room available
-                    values.Add(key, priorities.AddLast(new Slot(key, entry, _time.GetUtcNow())));
-                    return Result.Success;
+                    else {
+
+                        values.Add(key, priorities.AddLast(new Slot(key, entry, now)));
+                        result = Result.Success;
+                    }
                 }
+
+                return result;
             }
             finally {
 
-                Raise(expired);
+                RaiseExpire(expired);
+
+                if (evicted is { } slot)
+                    RaiseEvict(slot);
             }
         }
 
+        // Safely get while removing
         public bool TryWithdraw<TKey, TType>(
             TKey k,
             out Entry<TType> entry) where TKey : struct, Enum
@@ -329,7 +297,7 @@ namespace ObjectLibrary {
                     expired = SweepExpired();
 
                     if (!values.TryGetValue(EnumKey.Create(k), out LinkedListNode<Slot>? node))
-                        return Result.WrongKey;
+                        return Result.KeyNotFound;
 
                     if (node.Value.Value is not Entry<TType> found)
                         throw new ArgumentException($"Entry under this key is {node.Value.Value.GetType()}, not {typeof(Entry<TType>)}.");
@@ -343,32 +311,19 @@ namespace ObjectLibrary {
             }
             finally {
 
-                Raise(expired);
+                RaiseExpire(expired);
             }
         }
 
-        public object? TryPeek<TKey>( 
-            TKey k) where TKey : struct, Enum {
+        public bool TryUpdateOrAdd<TKey, TType>(
+            TKey k,
+            Entry<TType> entry) where TKey : struct, Enum
+            => TryUpdateOrAddResult(k, entry) == Result.Success;
 
-            List<Slot>? expired = null;
-
-            try {
-
-                lock (syncRoot) {
-
-                    expired = SweepExpired();
-
-                    if (!values.TryGetValue(EnumKey.Create(k), out LinkedListNode<Slot>? node))
-                        return default;
-
-                    return node.Value.Value;
-                }
-            }
-            finally {
-
-                Raise(expired);
-            }
-        }
+        public Result TryUpdateOrAddResult<TKey, TType>(
+            TKey k,
+            Entry<TType> entry) where TKey : struct, Enum
+            => TryAddResult(k, entry, overwrite: true);
 
         public bool ContainsKey<TKey>(
             TKey k) where TKey : struct, Enum {
@@ -386,7 +341,7 @@ namespace ObjectLibrary {
             }
             finally {
 
-                Raise(expired);
+                RaiseExpire(expired);
             }
         }
 
@@ -411,11 +366,10 @@ namespace ObjectLibrary {
             }
             finally {
 
-                Raise(expired);
+                RaiseExpire(expired);
             }
         }
 
-        // Doesn't need an expiry event fire, thats for natural expiration not user clearing.
         public void Clear() {
 
             List<Slot>? expired = null;
@@ -432,7 +386,7 @@ namespace ObjectLibrary {
             }
             finally {
 
-                Raise(expired);
+                RaiseExpire(expired);
             }
         }
     }
