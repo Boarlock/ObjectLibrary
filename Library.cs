@@ -54,11 +54,15 @@ namespace ObjectLibrary {
             bool? overwriteOldEntries = null) {
 
             _overwriteOld = overwriteOldEntries ?? false;
-            _capacity = initialCapacity ?? int.MaxValue;
 
             var t = timeToExpire ?? TimeSpan.MaxValue;
+            var c = initialCapacity ?? int.MaxValue;
+
             ArgumentOutOfRangeException.ThrowIfLessThanOrEqual(t, TimeSpan.Zero);
+            ArgumentOutOfRangeException.ThrowIfNegative(c);
+
             _timeToExpire = t;
+            _capacity = c;
         }
 
         private readonly object syncRoot = new();
