@@ -1,12 +1,10 @@
-﻿using System.Runtime.CompilerServices;
+﻿using System.Diagnostics.CodeAnalysis;
+using System.Runtime.CompilerServices;
 
 namespace ObjectLibrary {
 
     public readonly record struct KeyedEntry(EnumKey Key, object Value);
-    public sealed class Entry<TType>(TType value) {
-
-        public TType Value { get; } = value;
-    }
+    public sealed class Entry<TType>(TType value) { public TType Value { get; } = value; }
 
     internal readonly record struct Slot(
         EnumKey Key, 
@@ -48,10 +46,20 @@ namespace ObjectLibrary {
         Full
     }
 
-    public class Library(
-        int? initialCapacity = null, 
-        TimeSpan? timeToExpire = null,
-        bool? overwriteOldEntries = null) {
+    public class Library {
+
+        public Library(
+            int? initialCapacity = null,
+            TimeSpan? timeToExpire = null,
+            bool? overwriteOldEntries = null) {
+
+            _overwriteOld = overwriteOldEntries ?? false;
+            _capacity = initialCapacity ?? int.MaxValue;
+
+            var t = timeToExpire ?? TimeSpan.MaxValue;
+            ArgumentOutOfRangeException.ThrowIfLessThanOrEqual(t, TimeSpan.Zero);
+            _timeToExpire = t;
+        }
 
         private readonly object syncRoot = new();
 
@@ -61,23 +69,24 @@ namespace ObjectLibrary {
         private readonly LinkedList<Slot> priorities = new();
         private readonly Dictionary<EnumKey, LinkedListNode<Slot>> values = new();
 
-        private readonly TimeSpan _timeToExpire = timeToExpire ?? TimeSpan.MaxValue;
+        private readonly TimeSpan _timeToExpire;
         private readonly TimeProvider _time = TimeProvider.System;
 
-        private volatile bool overwriteOld = overwriteOldEntries ?? false;
+        private volatile bool _overwriteOld;
         public bool OverwriteOld {
 
-            get => overwriteOld;
-            set => overwriteOld = value;
+            get => _overwriteOld;
+            set => _overwriteOld = value;
         }
 
-        private int capacity = initialCapacity ?? int.MaxValue;
+        private int _capacity;
         public int Capacity {
 
-            get => capacity;
+            get => Volatile.Read(ref _capacity);
             set {
 
                 List<Slot>? expired = null;
+                List<Slot>? evicted = null;
 
                 try {
 
@@ -87,20 +96,26 @@ namespace ObjectLibrary {
 
                         expired = SweepExpired();
 
+                        if (values.Count > value &&
+                            !_overwriteOld)
+                            throw new ArgumentException("Cannot lower capacity below count when OverwriteOld is set to false.", nameof(value));
+
                         while (values.Count > value) {
 
                             LinkedListNode<Slot> oldNode = priorities.First!;
 
+                            (evicted ??= []).Add(oldNode.Value);
                             values.Remove(oldNode.Value.Key);
                             priorities.Remove(oldNode);
                         }
 
-                        capacity = value;
+                        _capacity = value;
                     }
                 }
                 finally {
 
-                    RaiseExpire(expired);
+                    RaiseExpired(expired);
+                    RaiseEvicted(evicted);
                 }
             }
         }
@@ -122,7 +137,7 @@ namespace ObjectLibrary {
                 }
                 finally {
 
-                    RaiseExpire(expired);
+                    RaiseExpired(expired);
                 }
             }
         }
@@ -147,26 +162,40 @@ namespace ObjectLibrary {
             return expired;
         }
 
-        private void RaiseExpire(List<Slot>? expired) {
+        private static void InvokeAll(
+            Action<KeyedEntry>? handlers, 
+            KeyedEntry arg) {
 
-            if (expired is null or { Count: 0 })
+            if (handlers is null)
                 return;
 
-            // copy so an unsubscribe can't null it mid-loop
-            if (OnExpire is not { } handler)
-                return;
-            
-            foreach (Slot slot in expired) {
+            foreach (Delegate d in handlers.GetInvocationList()) {
 
-                try { handler(new KeyedEntry(slot.Key, slot.Value)); }
-                catch { }
+                try { ((Action<KeyedEntry>)d)(arg); }
+                catch { /* isolate each subscriber */ }
             }
         }
 
-        private void RaiseEvict(Slot evicted) {
+        private void RaiseExpired(List<Slot>? expired) {
 
-            try { OnEvict?.Invoke(new KeyedEntry(evicted.Key, evicted.Value)); }
-            catch { }
+            if (expired is null)
+                return;
+
+            var handlers = OnExpire;
+
+            foreach (Slot slot in expired)
+                InvokeAll(handlers, new KeyedEntry(slot.Key, slot.Value));
+        }
+
+        private void RaiseEvicted(List<Slot>? expired) {
+
+            if (expired is null)
+                return;
+
+            var handlers = OnEvict;
+
+            foreach (Slot slot in expired)
+                InvokeAll(handlers, new KeyedEntry(slot.Key, slot.Value));
         }
 
         private void MoveToEnd(LinkedListNode<Slot> node) {
@@ -175,21 +204,27 @@ namespace ObjectLibrary {
             priorities.AddLast(node);
         }
 
-        // Snapshot gets entries from newest to oldest.
-        // Snapshot is made under lock, after return values can be changed before user can act on them.
+        // Snapshot gets entries from oldest to newest (i.e eviction order)
         public List<KeyedEntry> GetSnapshot() {
 
             List<KeyedEntry> entries = new();
+            List<Slot>? expired = null;
 
-            lock (syncRoot) {
+            try {
 
-                if (priorities.First is null)
-                    return entries;
+                lock (syncRoot) {
 
-                foreach (Slot slot in priorities) {
+                    expired = SweepExpired();
 
-                    entries.Add(new KeyedEntry(slot.Key, slot.Value));
+                    foreach (Slot slot in priorities) {
+
+                        entries.Add(new KeyedEntry(slot.Key, slot.Value));
+                    }
                 }
+            }
+            finally {
+
+                RaiseExpired(expired);
             }
 
             return entries;
@@ -208,7 +243,7 @@ namespace ObjectLibrary {
             bool overwrite = false) where TKey : struct, Enum {
 
             List<Slot>? expired = null;
-            Slot? evicted = null;
+            List<Slot>? evicted = null;
             Result result;
 
             try {
@@ -222,7 +257,7 @@ namespace ObjectLibrary {
 
                     var now = _time.GetUtcNow();
                     bool exists = values.TryGetValue(key, out var node);
-                    bool full = values.Count >= capacity;
+                    bool full = values.Count >= _capacity;
 
                     // Key taken, caller didn't ask to replace it
                     if (exists && !overwrite) {
@@ -234,7 +269,7 @@ namespace ObjectLibrary {
 
                         // Re-adding the same Entry isn't a displacement
                         if (!ReferenceEquals(node!.Value.Value, entry))
-                            evicted = node.Value;
+                            (evicted ??= []).Add(node.Value);
 
                         node.Value = new Slot(key, entry, now);
                         MoveToEnd(node);
@@ -242,7 +277,7 @@ namespace ObjectLibrary {
                         result = Result.Success;
                     }
                     // Full and not allowed to evict (also covers capacity 0)
-                    else if (full && (!overwriteOld || priorities.First is null)) {
+                    else if (full && (!_overwriteOld || priorities.First is null)) {
 
                         result = Result.Full;
                     }
@@ -250,7 +285,7 @@ namespace ObjectLibrary {
                     else if (full) {
 
                         var oldNode = priorities.First!;
-                        evicted = oldNode.Value;
+                        (evicted ??= []).Add(oldNode.Value);
 
                         values.Remove(oldNode.Value.Key);
                         oldNode.Value = new Slot(key, entry, now);
@@ -270,17 +305,15 @@ namespace ObjectLibrary {
             }
             finally {
 
-                RaiseExpire(expired);
-
-                if (evicted is { } slot)
-                    RaiseEvict(slot);
+                RaiseExpired(expired);
+                RaiseEvicted(evicted);
             }
         }
 
         // Safely get while removing
         public bool TryWithdraw<TKey, TType>(
             TKey k,
-            out Entry<TType> entry) where TKey : struct, Enum
+            [MaybeNullWhen(false)]  out Entry<TType> entry) where TKey : struct, Enum
             => TryWithdrawResult(k, out entry) == Result.Success;
 
         public Result TryWithdrawResult<TKey, TType>(
@@ -311,7 +344,7 @@ namespace ObjectLibrary {
             }
             finally {
 
-                RaiseExpire(expired);
+                RaiseExpired(expired);
             }
         }
 
@@ -341,7 +374,7 @@ namespace ObjectLibrary {
             }
             finally {
 
-                RaiseExpire(expired);
+                RaiseExpired(expired);
             }
         }
 
@@ -366,7 +399,7 @@ namespace ObjectLibrary {
             }
             finally {
 
-                RaiseExpire(expired);
+                RaiseExpired(expired);
             }
         }
 
@@ -386,7 +419,7 @@ namespace ObjectLibrary {
             }
             finally {
 
-                RaiseExpire(expired);
+                RaiseExpired(expired);
             }
         }
     }
